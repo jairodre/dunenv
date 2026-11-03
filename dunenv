@@ -1,0 +1,1457 @@
+#!/usr/bin/env python3
+"""
+dunenv - DUNE SL7 container + software environment launcher.
+
+One command for the whole workflow that duneSL7_setup.sh does:
+
+    host shell                         inside the SL7 container
+    ----------                         ------------------------
+    dunenv                (menu)       dunenv                (menu)
+    dunenv start [ENV] [build]  --->   (setup runs automatically)
+    dunenv shell [build]               dunenv setup [ENV]
+    dunenv list                        dunenv justin
+    dunenv add NAME AREA               dunenv status
+    dunenv new NAME DIR -v VER  (create + build an MRB area, dunebuild* only)
+    dunenv rebuild NAME [--clean]  (recompile a registered area, dunebuild* only)
+
+Everything that can change lives in dunenv.ini (next to this file):
+dunesw version/qualifier, extra UPS packages, exported variables, container
+image and binds, and the local MRB environments ([env:<name>] sections).
+
+How the pieces fit together
+---------------------------
+1. This Python file never touches the shell environment itself. It reads
+   dunenv.ini, decides what to set up (the "plan"), and writes a bash script
+   that does it.
+2. "start" launches apptainer with  bash --rcfile dunenv.sh -i  and passes the
+   bash script through the DUNENV_AUTORUN variable (base64 encoded, so no
+   character in it can be mangled on the way into the container). dunenv.sh
+   decodes and runs it inside the new container shell.
+3. Inside a shell, "setup" / "justin" must change *that* shell, so they go
+   through the "dunenv" bash function defined in dunenv.sh: the function asks
+   this program to write the script to a temporary file (DUNENV_EMIT), sources
+   it, and deletes it.
+
+Written for the Python 3.6 in the SL7 container and the 3.9 on the EL9 host.
+"""
+
+import argparse
+import base64
+import configparser
+import fnmatch
+import os
+import re
+import shlex
+import socket
+import subprocess
+import sys
+import time
+
+# ===========================================================================
+# Block 1 - Locations and terminal colors
+# ===========================================================================
+
+DUNENV_HOME = os.path.dirname(os.path.realpath(__file__))
+CONFIG_PATH = os.environ.get("DUNENV_CONFIG", os.path.join(DUNENV_HOME, "dunenv.ini"))
+HOOK_PATH = os.path.join(DUNENV_HOME, "dunenv.sh")
+
+RED, GREEN, YELLOW, BLUE, BOLD, RESET = (
+    "\033[31m", "\033[1;32m", "\033[33m", "\033[34m", "\033[1m", "\033[0m")
+
+
+def eprint(*parts):
+    print(*parts, file=sys.stderr)
+
+
+def fail(message, code=2):
+    eprint("{}error:{} {}".format(RED, RESET, message))
+    return code
+
+
+def in_container():
+    return bool(os.environ.get("APPTAINER_CONTAINER") or os.environ.get("SINGULARITY_CONTAINER"))
+
+
+# ===========================================================================
+# Block 2 - Default configuration (written to dunenv.ini on first use)
+#   The values reproduce what duneSL7_setup.sh did, so the first run behaves
+#   the same way. After that, dunenv.ini is the only place to edit.
+# ===========================================================================
+
+DEFAULT_CONFIG = """\
+# =============================================================================
+# dunenv configuration
+#   Edit by hand ("dunenv edit") or with  dunenv set / add / rm / pkg.
+#   Comments must be on their own line. A value continues on the next lines
+#   when those lines are indented (used for package lists).
+#   ${USER} and ${HOME} are expanded.
+# =============================================================================
+
+[defaults]
+# dunesw release used when the chosen environment does not fix one
+# (a local MRB environment always uses the release it was built with).
+version   = v10_17_01d00
+qualifier = e26:prof
+
+# Environment used when none is named: "none" = dunesw + packages only.
+env = none
+
+# Token + JUSTIN + Rucio block at the end of setup (yes/no).
+# Turn off for one run with --no-grid.
+grid = yes
+
+# Folder to cd into when setup is finished (empty = stay where you are).
+workdir = /exp/dune/app/users/${USER}
+
+# UPS products set up after dunesw, one per line, written exactly as you
+# would type them after "setup". {version} and {qualifier} are replaced by
+# the active dunesw release, e.g.
+#     duneprototypes {version} -q {qualifier}
+#     larsoft v10_17_01 -q e26:prof
+# Add one for a single run with:  -p "name version -q qual"
+# Add one permanently with:       dunenv pkg add "name version -q qual"
+packages =
+    metacat
+    rucio
+    justin
+
+# UPS bootstrap and the personal profile sourced at the end of setup.
+ups_setup = /cvmfs/dune.opensciencegrid.org/products/dune/setup_dune.sh
+profile   = ${HOME}/.bash_profile
+
+[exports]
+# Exported before the UPS bootstrap. NAME = value
+UPS_OVERRIDE            = -H Linux64bit+3.10-2.17
+IFDH_CP_MAXRETRIES      = 0
+METACAT_SERVER_URL      = https://metacat.fnal.gov:9443/dune_meta_prod/app
+METACAT_AUTH_SERVER_URL = https://metacat.fnal.gov:8143/auth/dune
+X509_CERT_DIR           = /cvmfs/oasis.opensciencegrid.org/mis/certificates
+
+[grid]
+token_cmd     = htgettoken -a htvaultprod.fnal.gov -i dune
+rucio_account = justinreadonly
+
+[container]
+apptainer   = /cvmfs/oasis.opensciencegrid.org/mis/apptainer/current/bin/apptainer
+image       = /cvmfs/singularity.opensciencegrid.org/fermilab/fnal-dev-sl7:latest
+# normal container (has /pnfs/dune for data access)
+binds       = /cvmfs,/exp,/nashome,/pnfs/dune,/opt,/run/user,/etc/hostname,/etc/hosts,/etc/krb5.conf
+# "build" container (same list without /pnfs/dune)
+build_binds = /cvmfs,/exp,/nashome,/opt,/run/user,/etc/hostname,/etc/hosts,/etc/krb5.conf
+
+[newdev]
+# Used by "dunenv new NAME AREA -v VERSION" to create + build a new MRB area.
+# MRB project name (localProducts_<project>_<version>_<qual>); --project overrides.
+project = protoduneana
+# Packages checked out with "mrb g -t <version>", in this order; -p overrides.
+# Default: only protoduneana (it then uses the dunereco installed with dunesw).
+# Add more here or per run with -p. Note: protoduneana v10_26_00d05 needs
+# dunereco at build time but does not declare it in ups/product_deps, so with
+# both checked out, add "dunereco <version>" to that file and run "mrb uc".
+packages =
+    protoduneana
+# Parallel build jobs (mrb i -j N); -j overrides.
+jobs = 20
+# The build step only runs on machines matching one of these patterns
+# (space separated, * and ? allowed). Never on the dunegpvms.
+build_hosts = dunebuild*.fnal.gov
+# Where the tags are checked before anything is created ({package} is replaced).
+repo_url = https://github.com/DUNE/{package}.git
+
+# =============================================================================
+# Local MRB environments - one [env:<name>] section each.
+#   area      MRB top folder holding localProducts_<project>_<version>_<qual>
+#   desc      one line shown by "dunenv list" and the menu
+#   packages  extra UPS products for this environment only (same format)
+#   after     extra shell lines run after mrbslp (indented, one per line)
+#   version / qualifier   only needed when the area holds several
+#                         localProducts_* folders, to pick one
+# The dunesw release is read from the localProducts_* folder name.
+# New environment:  dunenv add <name> <area> [--desc "..."]
+# =============================================================================
+
+[env:pana]
+desc = Local protoduneana (single-particle LArSoft modules)
+area = /exp/dune/app/users/jairorod/protoDUNE/larmodule_singlep_protoduneana
+"""
+
+NO_ENV_NAMES = ("none", "base", "dunesw", "")
+
+
+# ===========================================================================
+# Block 3 - Reading the configuration
+# ===========================================================================
+
+def _expand(value):
+    return os.path.expandvars(os.path.expanduser(value))
+
+
+def _lines(value):
+    """Multi-line config value -> list of non-empty lines."""
+    return [line.strip() for line in (value or "").splitlines() if line.strip()]
+
+
+class Config:
+    def __init__(self, path):
+        self.path = path
+        if not os.path.exists(path):
+            with open(path, "w") as handle:
+                handle.write(DEFAULT_CONFIG)
+            eprint("{}created{} {}".format(GREEN, RESET, path))
+        self.parser = configparser.ConfigParser(interpolation=None)
+        self.parser.optionxform = str        # keep the case of exported variable names
+        self.parser.read(path)
+
+    def get(self, section, key, default=""):
+        return _expand(self.parser.get(section, key, fallback=default).strip())
+
+    def flag(self, section, key, default=True):
+        return self.parser.getboolean(section, key, fallback=default)
+
+    def env_names(self):
+        return [s[4:] for s in self.parser.sections() if s.startswith("env:")]
+
+    def env(self, name):
+        section = "env:" + name
+        if not self.parser.has_section(section):
+            return None
+        return {key: self.parser.get(section, key) for key in self.parser.options(section)}
+
+
+# ===========================================================================
+# Block 4 - Local MRB areas
+#   An MRB area contains localProducts_<project>_<version>_<qual>/setup.
+#   The folder name tells which dunesw release the area was built against.
+# ===========================================================================
+
+LOCAL_PRODUCTS_RE = re.compile(
+    r"^localProducts_(?P<project>.+?)_(?P<version>v\d+_\d+_\d+[A-Za-z0-9]*)_(?P<qual>[A-Za-z0-9_]+)$")
+
+
+def find_local_products(area):
+    """All usable localProducts_* folders in an MRB area."""
+    found = []
+    if not os.path.isdir(area):
+        return found
+    for name in sorted(os.listdir(area)):
+        match = LOCAL_PRODUCTS_RE.match(name)
+        setup_file = os.path.join(area, name, "setup")
+        if match and os.path.isfile(setup_file):
+            found.append({
+                "dir": os.path.join(area, name),
+                "setup": setup_file,
+                "project": match.group("project"),
+                "version": match.group("version"),
+                "qualifier": match.group("qual").replace("_", ":"),
+            })
+    return found
+
+
+def describe_products(products):
+    return ", ".join("{} -q {}".format(p["version"], p["qualifier"]) for p in products) or "none"
+
+
+# ===========================================================================
+# Block 5 - Plan: what one setup run will do
+#   Resolution order for the dunesw release:
+#     local env  -> the release of its localProducts_* folder
+#                   (-v/-q, or the env's version/qualifier keys, only choose
+#                    among several folders; a mismatch is an error, because
+#                    the local build only works with its own release)
+#     no env     -> -v/-q from the command line, else [defaults]
+# ===========================================================================
+
+class PlanError(Exception):
+    pass
+
+
+def make_plan(cfg, env_name=None, version=None, qualifier=None, extra_packages=(),
+              grid=None, dev=False, flavor="normal"):
+    if env_name is None:
+        env_name = cfg.get("defaults", "env", "none")
+    env_name = env_name.strip()
+    default_version = cfg.get("defaults", "version")
+    default_qualifier = cfg.get("defaults", "qualifier")
+
+    plan = {
+        "env": "none",
+        "local": None,
+        "after": [],
+        "flavor": flavor,
+        "dev": dev,
+        "grid": cfg.flag("defaults", "grid", True) if grid is None else grid,
+    }
+    env_packages = []
+
+    if env_name.lower() in NO_ENV_NAMES:
+        plan["version"] = version or default_version
+        plan["qualifier"] = qualifier or default_qualifier
+    else:
+        env = cfg.env(env_name)
+        if env is None:
+            raise PlanError("unknown environment '{}'. Known: {}  (add one with: dunenv add {} <area>)"
+                            .format(env_name, ", ".join(cfg.env_names()) or "none", env_name))
+        area = _expand(env.get("area", ""))
+        products = find_local_products(area)
+        if not products:
+            raise PlanError("environment '{}': no localProducts_*/setup in {}".format(env_name, area))
+
+        want_version = version or _expand(env.get("version", "")).strip()
+        want_qualifier = qualifier or _expand(env.get("qualifier", "")).strip()
+        matches = [p for p in products
+                   if (not want_version or p["version"] == want_version)
+                   and (not want_qualifier or p["qualifier"] == want_qualifier)]
+        if not matches:
+            raise PlanError(
+                "environment '{}' has no build for {} -q {}.\n"
+                "       Available in {}: {}\n"
+                "       Drop -v/-q to use the built release, or create a new MRB area for {} and\n"
+                "       register it:  dunenv add <name> <new area>"
+                .format(env_name, want_version or "*", want_qualifier or "*", area,
+                        describe_products(products), want_version or "that release"))
+        if len(matches) > 1:
+            preferred = [p for p in matches
+                         if p["version"] == default_version and p["qualifier"] == default_qualifier]
+            if len(preferred) != 1:
+                raise PlanError("environment '{}' has several builds ({}); choose one with -v/-q "
+                                "or set version/qualifier in [env:{}]"
+                                .format(env_name, describe_products(matches), env_name))
+            matches = preferred
+
+        plan.update(env=env_name, local=matches[0], area=area,
+                    version=matches[0]["version"], qualifier=matches[0]["qualifier"])
+        plan["after"] = _lines(env.get("after", ""))
+        env_packages = _lines(env.get("packages", ""))
+
+    # UPS packages: [defaults] list, then the env list, then -p options.
+    lines = _lines(cfg.parser.get("defaults", "packages", fallback="")) + env_packages + list(extra_packages)
+    plan["packages"] = [line.format(version=plan["version"], qualifier=plan["qualifier"]) for line in lines]
+    return plan
+
+
+def equivalent_command(plan, default_env):
+    """The short command that reproduces a plan (shown after the menu)."""
+    words = ["dunenv", "start"]
+    if plan["env"] != "none" or default_env.lower() not in NO_ENV_NAMES:
+        words.append(plan["env"])
+    if plan["flavor"] == "build":
+        words.append("build")
+    if not plan["grid"]:
+        words.append("--no-grid")
+    return " ".join(words)
+
+
+# ===========================================================================
+# Block 6 - Bash generation
+#   Every block of the generated script prints a header so the terminal
+#   shows which step is running. Steps:
+#     1 exports   2 UPS + dunesw   3 extra packages   4 local MRB env
+#     5 profile   6 token + JUSTIN + Rucio   7 cd workdir
+# ===========================================================================
+
+def _q(value):
+    return shlex.quote(value)
+
+
+def bash_grid_function(cfg):
+    """JUSTIN check -> token -> Rucio account. Stops cleanly when JUSTIN needs the browser."""
+    return """\
+_dunenv_grid() {{
+    local out st
+    printf '\\n=== {b}JUSTIN / Rucio{r} ===\\n'
+    out="$(justin time 2>&1)"; st=$?
+    printf '%s\\n' "$out"
+    if ((st != 0)) || [[ "$out" == *"authorize this computer"* ]]; then
+        printf '\\n{y}JUSTIN authorization is required.{r}\\n'
+        printf 'Finish the browser authorization, then run:  dunenv justin\\n'
+        return 20
+    fi
+    justin get-token || return $?
+    export RUCIO_ACCOUNT={account}
+    rucio whoami || return $?
+}}
+""".format(b=BOLD, r=RESET, y=YELLOW, account=_q(cfg.get("grid", "rucio_account", "justinreadonly")))
+
+
+def bash_export_lines(cfg):
+    """The [exports] section as 'export NAME=value' lines (indented for a function body)."""
+    names = cfg.parser.options("exports") if cfg.parser.has_section("exports") else []
+    return ["    export {}={}".format(name, _q(cfg.get("exports", name))) for name in names]
+
+
+def bash_setup_script(cfg, plan):
+    out = []
+    add = out.append
+    add("# --- generated by dunenv: env={} dunesw {} -q {} ---".format(
+        plan["env"], plan["version"], plan["qualifier"]))
+    add("_dunenv_ups() {")
+    add("    printf '  setup %s\\n' \"$*\"")
+    add("    setup \"$@\" || printf '  {}WARNING{} setup %s failed\\n' \"$*\" >&2".format(RED, RESET))
+    add("}")
+    add(bash_grid_function(cfg))
+    add("_dunenv_setup() {")
+
+    add("    # 1) Variables needed before the UPS bootstrap")
+    out.extend(bash_export_lines(cfg))
+
+    add("    # 2) UPS bootstrap + dunesw")
+    add("    source {} || return 1".format(_q(cfg.get("defaults", "ups_setup"))))
+    add("    export DUNESW_VERSION={} DUNESW_QUALIFIER={}".format(_q(plan["version"]), _q(plan["qualifier"])))
+    add("    printf '\\n=== Setting up {g}dunesw %s{r} with qualifier {y}%s{r} ===\\n\\n' "
+        "\"$DUNESW_VERSION\" \"$DUNESW_QUALIFIER\"".format(g=GREEN, y=YELLOW, r=RESET))
+    add("    setup dunesw \"$DUNESW_VERSION\" -q \"$DUNESW_QUALIFIER\" || "
+        "{{ printf '{}setup dunesw failed{}\\n' >&2; return 1; }}".format(RED, RESET))
+
+    if plan["packages"]:
+        add("    # 3) Extra UPS products")
+        add("    printf '\\n=== UPS products ===\\n'")
+        for line in plan["packages"]:
+            add("    _dunenv_ups {}".format(line))
+
+    local = plan["local"]
+    if local:
+        add("    # 4) Local MRB environment '{}'".format(plan["env"]))
+        add("    printf '\\n=== Local environment {b}{name}{r} ===\\n'".format(b=BOLD, r=RESET, name=plan["env"]))
+        add("    source {} || return 2".format(_q(local["setup"])))
+        if plan["dev"]:
+            add("    mrbsetenv || return 2")
+        add("    mrbslp")
+        for line in plan["after"]:
+            add("    " + line)
+        add("    printf 'Local %s sourced from: %s\\nVersion: %s  Qualifiers: %s\\n' "
+            "\"$MRB_PROJECT\" \"$MRB_TOP\" \"$MRB_PROJECT_VERSION\" \"$MRB_QUALS\"")
+    add("    export DUNENV_ACTIVE={}".format(_q(plan["env"])))
+
+    profile = cfg.get("defaults", "profile")
+    if profile:
+        add("    # 5) Personal profile")
+        add("    [[ -r {p} ]] && source {p}".format(p=_q(profile)))
+
+    if plan["grid"]:
+        add("    # 6) Token + JUSTIN + Rucio")
+        add("    printf '\\n=== Token ===\\n'")
+        add("    {}".format(cfg.get("grid", "token_cmd")))
+        add("    _dunenv_grid")
+        add("    local grid_status=$?")
+    add("    printf '\\n{g}dunenv ready:{r} env=%s  dunesw %s -q %s\\n' "
+        "\"$DUNENV_ACTIVE\" \"$DUNESW_VERSION\" \"$DUNESW_QUALIFIER\"".format(g=GREEN, r=RESET))
+    workdir = cfg.get("defaults", "workdir")
+    if workdir:
+        add("    # 7) Working folder (last, so the folder listing ends the output)")
+        add("    cd {} && echo \"$PWD\"".format(_q(workdir)))
+    if plan["grid"]:
+        add("    return $grid_status")
+    add("}")
+    add("_dunenv_setup")
+    return "\n".join(out) + "\n"
+
+
+def bash_justin_script(cfg):
+    return bash_grid_function(cfg) + "_dunenv_grid\n"
+
+
+# ===========================================================================
+# Block 7 - Handing a script to the current shell, or to a new container
+# ===========================================================================
+
+def deliver_to_shell(script, args_for_hint):
+    """Write the script where the 'dunenv' bash function will source it."""
+    target = os.environ.get("DUNENV_EMIT")
+    if target:
+        with open(target, "w") as handle:
+            handle.write(script)
+        return 0
+    eprint("{}This step changes the current shell, so it must be sourced.{}".format(YELLOW, RESET))
+    eprint("  Load the shell function once:  source {}".format(HOOK_PATH))
+    eprint("  then run:                       dunenv {}".format(args_for_hint))
+    eprint("  or, without the function:       source <({} script ...)".format(os.path.realpath(__file__)))
+    return 2
+
+
+def launch_container(cfg, flavor, script=None, dry_run=False):
+    apptainer = cfg.get("container", "apptainer")
+    image = cfg.get("container", "image")
+    binds = cfg.get("container", "build_binds" if flavor == "build" else "binds")
+    argv = [apptainer, "exec", "-B", binds, "--ipc", "--pid", image,
+            "/bin/bash", "--rcfile", HOOK_PATH, "-i"]
+    env = dict(os.environ)
+    if script:
+        env["APPTAINERENV_DUNENV_AUTORUN"] = base64.b64encode(script.encode()).decode()
+
+    label = GREEN + "BUILD" + RESET + " container" if flavor == "build" else BOLD + "container" + RESET
+    print("\n=== Entering FNAL SL7 {} ===\n".format(label))
+    if dry_run:
+        print("{}[dry run]{} {}".format(YELLOW, RESET, " ".join(_q(a) for a in argv)))
+        if script:
+            print("\n# script run inside the container (DUNENV_AUTORUN):\n" + script)
+        return 0
+    sys.stdout.flush()
+    os.execve(apptainer, argv, env)
+
+
+# ===========================================================================
+# Block 8 - Small text editor for dunenv.ini
+#   configparser would drop every comment when writing, so edits are done on
+#   the text lines instead, then re-parsed to make sure the file is still valid.
+# ===========================================================================
+
+class IniText:
+    HEADER = re.compile(r"^\s*\[(?P<name>[^\]]+)\]\s*$")
+
+    def __init__(self, path):
+        self.path = path
+        with open(path) as handle:
+            self.lines = handle.read().splitlines()
+
+    def section(self, name):
+        """(header index, end index) of a section, end = next header or EOF."""
+        start = None
+        for i, line in enumerate(self.lines):
+            match = self.HEADER.match(line)
+            if match and start is not None:
+                return start, i
+            if match and match.group("name").strip() == name:
+                start = i
+        if start is None:
+            return None
+        return start, len(self.lines)
+
+    def key(self, section, key):
+        """(key line, end of its indented continuation) or None."""
+        rng = self.section(section)
+        if rng is None:
+            return None
+        pattern = re.compile(r"^{}\s*[=:]".format(re.escape(key)))
+        for i in range(rng[0] + 1, rng[1]):
+            if pattern.match(self.lines[i]):
+                end = i + 1
+                while end < rng[1] and self.lines[end][:1] in (" ", "\t") and self.lines[end].strip():
+                    end += 1
+                return i, end
+        return None
+
+    def _section_body_end(self, section):
+        start, end = self.section(section)
+        while end > start + 1 and not self.lines[end - 1].strip():
+            end -= 1
+        return end
+
+    def set(self, section, key, value):
+        if self.section(section) is None:
+            self.lines += ["", "[{}]".format(section)]
+        found = self.key(section, key)
+        new_line = "{} = {}".format(key, value)
+        if found:
+            self.lines[found[0]:found[1]] = [new_line]
+        else:
+            self.lines.insert(self._section_body_end(section), new_line)
+
+    def add_item(self, section, key, item):
+        found = self.key(section, key)
+        if found:
+            self.lines.insert(found[1], "    " + item)
+        else:
+            self.lines[self._section_body_end(section):self._section_body_end(section)] = \
+                ["{} =".format(key), "    " + item]
+
+    def remove_item(self, section, key, product):
+        found = self.key(section, key)
+        if not found:
+            return False
+        for i in range(found[0] + 1, found[1]):
+            words = self.lines[i].split()
+            if words and words[0] == product:
+                del self.lines[i]
+                return True
+        return False
+
+    def append_section(self, name, body):
+        while self.lines and not self.lines[-1].strip():
+            self.lines.pop()
+        self.lines += ["", "[{}]".format(name)] + body
+
+    def remove_section(self, name):
+        rng = self.section(name)
+        if rng is None:
+            return False
+        start, end = rng
+        while start > 0 and not self.lines[start - 1].strip():
+            start -= 1
+        del self.lines[start:end]
+        return True
+
+    def save(self):
+        text = "\n".join(self.lines) + "\n"
+        check = configparser.ConfigParser(interpolation=None)
+        check.read_string(text)                       # raises if the edit broke the file
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as handle:
+            handle.write(text)
+        os.replace(tmp, self.path)
+
+
+# ===========================================================================
+# Block 9 - Commands
+# ===========================================================================
+
+def _plan_from_args(cfg, args):
+    """Read the free words of start/setup: env name, 'build', 'normal', 'none'."""
+    env_name, flavor = None, "build" if getattr(args, "build", False) else "normal"
+    for word in args.words:
+        if word == "build":
+            flavor = "build"
+        elif word == "normal":
+            flavor = "normal"
+        elif env_name is None:
+            env_name = word
+        else:
+            raise PlanError("more than one environment given: {} and {}".format(env_name, word))
+    return make_plan(cfg, env_name=env_name, version=args.version, qualifier=args.qualifier,
+                     extra_packages=args.pkg, grid=args.grid, dev=args.dev, flavor=flavor)
+
+
+def print_plan(plan):
+    print("  container : {}".format(plan["flavor"]))
+    print("  dunesw    : {} -q {}".format(plan["version"], plan["qualifier"]))
+    if plan["local"]:
+        print("  local env : {}  ({}{})".format(plan["env"], plan["local"]["dir"],
+                                                 ", mrbsetenv" if plan["dev"] else ""))
+    else:
+        print("  local env : none")
+    print("  packages  : {}".format(", ".join(plan["packages"]) or "none"))
+    print("  grid      : {}".format("token + JUSTIN + Rucio" if plan["grid"] else "off"))
+
+
+def cmd_start(cfg, args):
+    if in_container():
+        eprint("{}Already inside a container{}: running the setup in this shell instead.".format(YELLOW, RESET))
+        return cmd_setup(cfg, args)
+    try:
+        plan = _plan_from_args(cfg, args)
+    except PlanError as err:
+        return fail(err)
+    print_plan(plan)
+    return launch_container(cfg, plan["flavor"], bash_setup_script(cfg, plan), args.dry_run)
+
+
+def cmd_setup(cfg, args):
+    try:
+        plan = _plan_from_args(cfg, args)
+    except PlanError as err:
+        return fail(err)
+    if not in_container() and not args.dry_run:
+        return fail("setup runs inside the SL7 container. On the host use:  dunenv start {}"
+                    .format(" ".join(args.words)))
+    print_plan(plan)
+    script = bash_setup_script(cfg, plan)
+    if args.dry_run:
+        print(script)
+        return 0
+    return deliver_to_shell(script, "setup " + " ".join(args.words))
+
+
+def cmd_script(cfg, args):
+    try:
+        print(bash_setup_script(cfg, _plan_from_args(cfg, args)), end="")
+    except PlanError as err:
+        return fail(err)
+    return 0
+
+
+def cmd_justin(cfg, args):
+    return deliver_to_shell(bash_justin_script(cfg), "justin")
+
+
+def cmd_shell(cfg, args):
+    if in_container():
+        return fail("already inside a container")
+    flavor = "build" if (args.build or "build" in args.words) else "normal"
+    return launch_container(cfg, flavor, None, args.dry_run)
+
+
+def cmd_list(cfg, args):
+    print("{}config{}  {}".format(BOLD, RESET, cfg.path))
+    print("{}default{} dunesw {} -q {}   env={}   grid={}".format(
+        BOLD, RESET, cfg.get("defaults", "version"), cfg.get("defaults", "qualifier"),
+        cfg.get("defaults", "env", "none"), cfg.get("defaults", "grid", "yes")))
+    print("{}packages{} {}".format(BOLD, RESET,
+                                   ", ".join(_lines(cfg.parser.get("defaults", "packages", fallback=""))) or "none"))
+    print("\n{}environments{}".format(BOLD, RESET))
+    print("  {:<12} {:<28} {}".format("none", "(default release)", "dunesw + packages only"))
+    for name in cfg.env_names():
+        env = cfg.env(name)
+        products = find_local_products(_expand(env.get("area", "")))
+        status = describe_products(products) if products else RED + "no localProducts found" + RESET
+        print("  {:<12} {:<28} {}".format(name, status, env.get("desc", "")))
+        if args.verbose:
+            print("  {:<12} area: {}".format("", _expand(env.get("area", ""))))
+            for line in _lines(env.get("packages", "")):
+                print("  {:<12} pkg : {}".format("", line))
+    return 0
+
+
+def cmd_status(cfg, args):
+    def show(label, value):
+        print("  {:<14} {}".format(label, value or "-"))
+    print("{}current shell{}".format(BOLD, RESET))
+    show("container", os.environ.get("APPTAINER_NAME") or ("no (host)" if not in_container() else "yes"))
+    show("dunenv env", os.environ.get("DUNENV_ACTIVE"))
+    if os.environ.get("DUNESW_VERSION"):
+        show("dunesw", "{} -q {}".format(os.environ.get("DUNESW_VERSION"), os.environ.get("DUNESW_QUALIFIER", "")))
+    show("MRB_TOP", os.environ.get("MRB_TOP"))
+    show("RUCIO_ACCOUNT", os.environ.get("RUCIO_ACCOUNT"))
+    if args.verbose and os.environ.get("UPS_DIR"):
+        print("\n{}active UPS products{}".format(BOLD, RESET))
+        sys.stdout.flush()
+        subprocess.call([os.path.join(os.environ["UPS_DIR"], "bin", "ups"), "active"])
+    return 0
+
+
+def env_name_problem(cfg, name):
+    """Why NAME cannot be a new environment name, or '' if it can."""
+    if name.lower() in NO_ENV_NAMES or name in ("build", "normal") or name in COMMANDS:
+        return "'{}' is a reserved word".format(name)
+    if not re.match(r"^[A-Za-z0-9_.-]+$", name):
+        return "environment names may only use letters, digits, '_', '.', '-'"
+    if cfg.env(name) is not None:
+        return "environment '{}' already exists (remove it first: dunenv rm {})".format(name, name)
+    return ""
+
+
+def register_env(cfg, name, area, desc=""):
+    """Append an [env:NAME] block for an existing MRB area."""
+    products = find_local_products(area)
+    if not products:
+        return fail("no localProducts_*/setup found in {}".format(area))
+    body = ["desc = {}".format(desc or "Local {} ({})".format(products[0]["project"], os.path.basename(area))),
+            "area = {}".format(area)]
+    text = IniText(cfg.path)
+    text.append_section("env:" + name, body)
+    text.save()
+    print("{}added{} env '{}' -> {}  [{}]".format(GREEN, RESET, name, area, describe_products(products)))
+    print("start it with:  dunenv start {}".format(name))
+    return 0
+
+
+def cmd_add(cfg, args):
+    problem = env_name_problem(cfg, args.name)
+    if problem:
+        return fail(problem)
+    return register_env(cfg, args.name, os.path.abspath(_expand(args.area)), args.desc)
+
+
+def cmd_rm(cfg, args):
+    text = IniText(cfg.path)
+    if not text.remove_section("env:" + args.name):
+        return fail("no environment '{}'".format(args.name))
+    text.save()
+    print("removed env '{}' (the MRB area itself is untouched)".format(args.name))
+    return 0
+
+
+SETTABLE = ("version", "qualifier", "env", "grid", "workdir", "profile", "ups_setup")
+
+
+def cmd_set(cfg, args):
+    section = "env:" + args.env if args.env else "defaults"
+    if args.env and cfg.env(args.env) is None:
+        return fail("no environment '{}'".format(args.env))
+    if not args.env and args.key not in SETTABLE:
+        return fail("settable defaults: {}".format(", ".join(SETTABLE)))
+    if args.key == "env" and args.value.lower() not in NO_ENV_NAMES and cfg.env(args.value) is None:
+        return fail("no environment '{}'".format(args.value))
+    text = IniText(cfg.path)
+    text.set(section, args.key, args.value)
+    text.save()
+    print("[{}] {} = {}".format(section, args.key, args.value))
+    return 0
+
+
+def cmd_pkg(cfg, args):
+    section = "env:" + args.env if args.env else "defaults"
+    if args.env and cfg.env(args.env) is None:
+        return fail("no environment '{}'".format(args.env))
+    if args.action == "list":
+        print("[{}] packages:".format(section))
+        for line in _lines(cfg.parser.get(section, "packages", fallback="")):
+            print("    " + line)
+        return 0
+    if not args.spec:
+        return fail("give the package, e.g.  dunenv pkg {} \"duneprototypes {{version}} -q {{qualifier}}\""
+                    .format(args.action))
+    spec = " ".join(args.spec)
+    text = IniText(cfg.path)
+    if args.action == "add":
+        text.add_item(section, "packages", spec)
+    elif not text.remove_item(section, "packages", spec.split()[0]):
+        return fail("'{}' is not in [{}] packages".format(spec.split()[0], section))
+    text.save()
+    print("[{}] packages {} {}".format(section, "+" if args.action == "add" else "-", spec))
+    return 0
+
+
+def cmd_scan(cfg, args):
+    """Look for MRB areas (folders holding localProducts_*) a few levels down."""
+    root = os.path.abspath(_expand(args.dir))
+    known = {_expand(cfg.env(n).get("area", "")).rstrip("/"): n for n in cfg.env_names()}
+    skip = {"srcs", "build_slf7.x86_64", "build_sl7.x86_64", ".git"}
+    base_depth = root.rstrip("/").count("/")
+    for top, dirs, _files in os.walk(root):
+        if top.count("/") - base_depth >= args.depth:
+            dirs[:] = []
+        products = [d for d in dirs if d.startswith("localProducts_")]
+        if products:
+            found = find_local_products(top)
+            tag = "registered as '{}'".format(known[top]) if top in known else YELLOW + "not registered" + RESET
+            print("{}  [{}]  {}".format(top, describe_products(found), tag))
+        dirs[:] = [d for d in dirs if d not in skip and not d.startswith((".", "localProducts_", "build_"))]
+    return 0
+
+
+def cmd_edit(cfg, args):
+    editor = os.environ.get("VISUAL") or os.environ.get("EDITOR") or "vim"
+    return subprocess.call(shlex.split(editor) + [cfg.path])
+
+
+# ===========================================================================
+# Block 9b - "dunenv new": fill and build a new MRB area
+#   You create the folder; this runs your usual steps in it:
+#       export MRB_PROJECT=<project>; mrb newDev -v <ver> -q <qual>
+#       source localProducts_<project>_<ver>_<qual>/setup
+#       cd srcs; mrb g -t <ver> <pkg> ...        ([newdev] packages, in order)
+#       cd $MRB_BUILDDIR; mrb z; mrbsetenv; mrb i -j <jobs>
+#   and registers the area as [env:<name>].
+#
+#   Checks, before anything is created:
+#     host   : folder exists and is empty, or a half-finished area of this
+#              same project/release; build step -> machine matches build_hosts
+#     inside : release exists in UPS; tag exists on GitHub for every package;
+#              build_hosts checked again right before "mrb z / mrb i"
+#   Steps already done are skipped, so after a failure the same command
+#   continues where it stopped. Output is also saved in <area>/dunenv_new_*.log.
+#
+#   Modes:  (default) everything | --no-build: stop after mrb g (add your
+#           modules) | --build-only: just the build of an existing area
+# ===========================================================================
+
+SAFE_WORD = re.compile(r"^[A-Za-z0-9_.:+-]+$")       # versions, qualifiers, projects, packages
+SAFE_HOST_PATTERN = re.compile(r"^[A-Za-z0-9_.*?-]+$")
+
+
+def host_names():
+    """Short and full name of this machine (both are matched against build_hosts)."""
+    names = {os.uname()[1]}
+    try:
+        names.add(socket.getfqdn())
+    except OSError:
+        pass
+    return sorted(name for name in names if name)
+
+
+def on_build_host(patterns):
+    return any(fnmatch.fnmatch(name, pattern) for name in host_names() for pattern in patterns)
+
+
+def area_problem(area, lp_name):
+    """Why AREA cannot be used, or '' when it is empty or a half-finished area of this release."""
+    if not os.path.isdir(area):
+        return "folder {} does not exist. Create it first (dunenv new never creates it).".format(area)
+    unexpected = []
+    for entry in sorted(os.listdir(area)):
+        if entry.startswith("."):
+            continue
+        if entry in ("srcs", lp_name) or entry.startswith("build_") or fnmatch.fnmatch(entry, "dunenv_*.log"):
+            continue
+        unexpected.append(entry)
+    if unexpected:
+        shown = ", ".join(unexpected[:8]) + (" ..." if len(unexpected) > 8 else "")
+        return ("{} is neither empty nor a half-finished {} area.\n       Unexpected: {}"
+                .format(area, lp_name, shown))
+    return ""
+
+
+NEWDEV_HEAD = r"""# --- generated by @COMMAND@: @NAME@ in @AREA@ ---
+AREA=@AREA_Q@
+PROJECT=@PROJECT_Q@
+VERSION=@VERSION_Q@
+QUALIFIER=@QUALIFIER_Q@
+JOBS=@JOBS@
+LOCAL_PRODUCTS="$AREA/@LP_NAME@"
+LOG="$AREA/@LOG_PREFIX@_@STAMP@.log"
+# mrbsetenv / mrbslp are UPS "aliases": eval + expand_aliases runs them either way
+shopt -s expand_aliases
+
+_step() { printf '\n\033[1m=== [%s] %s ===\033[0m\n' "$1" "$2"; }
+_stop() { printf '\n\033[31mSTOP:\033[0m %s\n' "$*" >&2; exit 1; }
+
+_on_build_host() {
+    local h
+    for h in "$(hostname -f 2>/dev/null)" "$(hostname)"; do
+        case "$h" in
+            @HOST_CASE@) return 0 ;;
+        esac
+    done
+    return 1
+}
+
+_check_tag() {   # <package> <repository url>
+    local refs
+    refs="$(GIT_TERMINAL_PROMPT=0 GIT_ASKPASS=/bin/true git ls-remote --tags "$2" "refs/tags/$VERSION" 2>/dev/null </dev/null)"
+    if [[ $? -ne 0 ]]; then
+        printf '  \033[33mWARNING\033[0m could not read %s; mrb g will report a missing tag\n' "$2"
+    elif [[ -z "$refs" ]]; then
+        _stop "$1 has no tag $VERSION in $2"
+    else
+        printf '  %-16s tag %s found\n' "$1" "$VERSION"
+    fi
+}
+
+_checkout() {    # <package>
+    if [[ -d "$MRB_SOURCE/$1" ]]; then
+        printf '  %-16s already in srcs/, skipping\n' "$1"
+    else
+        mrb g -t "$VERSION" "$1" || _stop "mrb g -t $VERSION $1 failed"
+    fi
+}
+
+_dunenv_new() {
+"""
+
+NEWDEV_UPS = r"""
+    _step 1 "UPS + dunesw $VERSION -q $QUALIFIER"
+    source @UPS_SETUP_Q@ || _stop "UPS bootstrap failed"
+    if ! ups exist dunesw "$VERSION" -q "$QUALIFIER"; then
+        printf 'dunesw releases starting with %s:\n' "${VERSION:0:6}"
+        ups list -aK+ dunesw | awk '{print $2}' | tr -d '"' | sort -u | grep "^${VERSION:0:6}" | tail -10
+        _stop "dunesw $VERSION -q $QUALIFIER is not in UPS"
+    fi
+    setup dunesw "$VERSION" -q "$QUALIFIER" || _stop "setup dunesw failed"
+"""
+
+NEWDEV_TAGS = r"""
+    _step 2 "Tags $VERSION on GitHub"
+@TAG_LINES@
+"""
+
+NEWDEV_CREATE = r"""
+    _step 3 "MRB area: $AREA"
+    cd "$AREA" || _stop "cannot enter $AREA"
+    if [[ -d "$LOCAL_PRODUCTS" ]]; then
+        printf '  %s already there, skipping mrb newDev\n' "${LOCAL_PRODUCTS##*/}"
+    else
+        export MRB_PROJECT="$PROJECT"
+        # This run's own log is already in the folder, and mrb newDev refuses any
+        # non-empty folder. Use -f only when the only entries (hidden ones
+        # included) are dunenv_*.log files and .locks, which mrb newDev
+        # creates itself before that check; otherwise let mrb's check decide.
+        local others
+        others="$(ls -A "$AREA" | grep -v -e '^dunenv_.*\.log$' -e '^\.locks$')"
+        if [[ -z "$others" ]]; then
+            mrb newDev -f -v "$VERSION" -q "$QUALIFIER" || _stop "mrb newDev failed"
+        else
+            mrb newDev -v "$VERSION" -q "$QUALIFIER" || _stop "mrb newDev failed"
+        fi
+        [[ -d "$LOCAL_PRODUCTS" ]] || _stop "mrb newDev did not create ${LOCAL_PRODUCTS##*/} (found: $(ls "$AREA" | tr '\n' ' '))"
+    fi
+"""
+
+NEWDEV_SOURCE = r"""
+    [[ -r "$LOCAL_PRODUCTS/setup" ]] || _stop "no $LOCAL_PRODUCTS/setup: the area was never created (dunenv new without --build-only)"
+    source "$LOCAL_PRODUCTS/setup" || _stop "source ${LOCAL_PRODUCTS##*/}/setup failed"
+"""
+
+NEWDEV_CHECKOUT = r"""
+    _step 4 "Check out packages at $VERSION"
+    cd "$MRB_SOURCE" || _stop "MRB_SOURCE is not set"
+@CHECKOUT_LINES@
+"""
+
+NEWDEV_HOST_CHECK = r"""
+    _step @STEP_HOST@ "Build machine check"
+    _on_build_host || _stop "this is $(hostname -f 2>/dev/null || hostname): builds with -j $JOBS only run on @HOST_LIST@"
+    printf '  %s matches @HOST_LIST@\n' "$(hostname -f 2>/dev/null || hostname)"
+"""
+
+# Clean build: everything recompiled from scratch (dunenv new, --build-only, rebuild --clean)
+NEWDEV_BUILD = NEWDEV_HOST_CHECK + r"""
+    _step @STEP_BUILD@ "Clean build: mrb z, mrbsetenv, mrb i -j $JOBS"
+    cd "$MRB_BUILDDIR" || _stop "MRB_BUILDDIR is not set"
+    mrb z
+    eval mrbsetenv || _stop "mrbsetenv failed"
+    mrb i -j "$JOBS" || _stop "build failed (mrb i): full output in $LOG"
+    eval mrbslp
+    printf '\n\033[1;32m@COMMAND@: built.\033[0m Log: %s\n' "$LOG"
+"""
+
+# Incremental build (dunenv rebuild): for edits inside existing module folders.
+# New folders added with add_subdirectory need the clean build (--clean).
+REBUILD_INCREMENTAL = NEWDEV_HOST_CHECK + r"""
+    _step @STEP_BUILD@ "Incremental build: mrbsetenv, make install -j $JOBS"
+    cd "$MRB_BUILDDIR" || _stop "MRB_BUILDDIR is not set"
+    [[ -f Makefile ]] || _stop "$MRB_BUILDDIR has no Makefile (never built, or emptied by mrb z): use --clean"
+    eval mrbsetenv || _stop "mrbsetenv failed"
+    make install -j "$JOBS" || _stop "build failed (make install): full output in $LOG"
+    eval mrbslp
+    printf '\n\033[1;32m@COMMAND@: built.\033[0m Log: %s\n' "$LOG"
+"""
+
+NEWDEV_NO_BUILD_END = r"""
+    printf '\n\033[1;32mdunenv new: area ready, not built.\033[0m Log: %s\n' "$LOG"
+    printf 'Add your modules to %s, then build on a build machine with:\n  %s\n' "$MRB_SOURCE" @BUILD_ONLY_CMD_Q@
+"""
+
+NEWDEV_TAIL = r"""}
+
+_dunenv_new 2>&1 | tee -a "$LOG"
+exit "${PIPESTATUS[0]}"
+"""
+
+
+def bash_newdev_script(cfg, spec):
+    """Assemble the bash run inside the build container for 'dunenv new' / 'dunenv rebuild'.
+
+    spec["mode"]:  full | no-build | build-only      (dunenv new)
+                   rebuild | rebuild-clean           (dunenv rebuild)
+    """
+    rebuild = spec["mode"].startswith("rebuild")
+    step_host, step_build = ("2", "3") if rebuild else ("5", "6")
+    tokens = {
+        "@COMMAND@": "dunenv rebuild" if rebuild else "dunenv new",
+        "@LOG_PREFIX@": "dunenv_rebuild" if rebuild else "dunenv_new",
+        "@STEP_HOST@": step_host,
+        "@STEP_BUILD@": step_build,
+        "@NAME@": spec["name"],
+        "@AREA@": spec["area"],
+        "@AREA_Q@": _q(spec["area"]),
+        "@PROJECT_Q@": _q(spec["project"]),
+        "@VERSION_Q@": _q(spec["version"]),
+        "@QUALIFIER_Q@": _q(spec["qualifier"]),
+        "@JOBS@": str(spec["jobs"]),
+        "@LP_NAME@": spec["lp_name"],
+        "@STAMP@": time.strftime("%Y%m%d_%H%M%S"),
+        "@HOST_CASE@": "|".join(spec["host_patterns"]),
+        "@HOST_LIST@": " ".join(spec["host_patterns"]),
+        "@UPS_SETUP_Q@": _q(cfg.get("defaults", "ups_setup")),
+        "@TAG_LINES@": "\n".join("    _check_tag {} {}".format(p, _q(spec["repo_url"].replace("{package}", p)))
+                                 for p in spec["packages"]),
+        "@CHECKOUT_LINES@": "\n".join("    _checkout {}".format(p) for p in spec["packages"]),
+        "@BUILD_ONLY_CMD_Q@": _q(spec.get("build_only_cmd", "")),
+    }
+
+    chunks = [NEWDEV_HEAD, "\n".join(bash_export_lines(cfg)) + "\n", NEWDEV_UPS]
+    if spec["mode"] == "rebuild":
+        chunks += [NEWDEV_SOURCE, REBUILD_INCREMENTAL]
+    elif spec["mode"] in ("build-only", "rebuild-clean"):
+        chunks += [NEWDEV_SOURCE, NEWDEV_BUILD]
+    else:
+        chunks += [NEWDEV_TAGS, NEWDEV_CREATE, NEWDEV_SOURCE, NEWDEV_CHECKOUT]
+        chunks.append(NEWDEV_NO_BUILD_END if spec["mode"] == "no-build" else NEWDEV_BUILD)
+    chunks.append(NEWDEV_TAIL)
+
+    script = "".join(chunks)
+    for token, value in tokens.items():
+        script = script.replace(token, value)
+    return script
+
+
+def build_settings(cfg, jobs_option):
+    """(jobs, host_patterns) from -j and [newdev]. Raises PlanError when invalid."""
+    try:
+        jobs = jobs_option if jobs_option is not None else int(cfg.get("newdev", "jobs", "20") or 20)
+    except ValueError:
+        raise PlanError("[newdev] jobs must be a number")
+    if jobs < 1:
+        raise PlanError("-j must be at least 1")
+    host_patterns = cfg.get("newdev", "build_hosts", "dunebuild*.fnal.gov").replace(",", " ").split()
+    if not host_patterns or not all(SAFE_HOST_PATTERN.match(p) for p in host_patterns):
+        raise PlanError("[newdev] build_hosts must be host patterns like dunebuild*.fnal.gov")
+    return jobs, host_patterns
+
+
+def build_host_refusal(host_patterns, jobs, advice):
+    """Message for a build started outside the build machines, or '' on a build machine."""
+    if on_build_host(host_patterns):
+        return ""
+    return ("this is {}: builds with -j {} only run on {}.\n"
+            "       Log in to a build machine (e.g. ssh {}@dunebuild02.fnal.gov){}"
+            .format(" / ".join(host_names()), jobs, " ".join(host_patterns),
+                    os.environ.get("USER", "you"), advice))
+
+
+def run_build_container(cfg, script, dry_run):
+    """Run the script in a fresh build container and wait for it (or only print it with -n)."""
+    argv = [cfg.get("container", "apptainer"), "exec", "-B", cfg.get("container", "build_binds"),
+            "--ipc", "--pid", cfg.get("container", "image"),
+            "/bin/bash", "--noprofile", "--norc", "-c", script]
+    if dry_run:
+        print("\n{}[dry run]{} {} ... /bin/bash --noprofile --norc -c <script below>\n".format(
+            YELLOW, RESET, " ".join(_q(a) for a in argv[:8])))
+        print(script)
+        return 0
+    print("\n=== Entering FNAL SL7 {}BUILD{} container (closes when done) ===".format(GREEN, RESET))
+    sys.stdout.flush()
+    return subprocess.call(argv)
+
+
+def cmd_new(cfg, args):
+    # --- 1. Options, with [newdev] defaults --------------------------------
+    if in_container():
+        return fail("run 'dunenv new' on the host: it opens its own build container")
+    if args.no_build and args.build_only:
+        return fail("--no-build and --build-only exclude each other")
+    mode = "no-build" if args.no_build else "build-only" if args.build_only else "full"
+
+    version = args.version
+    qualifier = args.qualifier or cfg.get("defaults", "qualifier")
+    packages = args.pkg or _lines(cfg.parser.get("newdev", "packages", fallback="protoduneana"))
+    project = args.project or cfg.get("newdev", "project") or packages[0]
+    repo_url = cfg.get("newdev", "repo_url", "https://github.com/DUNE/{package}.git")
+    try:
+        jobs, host_patterns = build_settings(cfg, args.jobs)
+    except PlanError as err:
+        return fail(err)
+
+    if not LOCAL_PRODUCTS_RE.match("localProducts_x_{}_y".format(version)):
+        return fail("version '{}' does not look like a release (vMM_mm_pp..., e.g. v10_26_00d05)".format(version))
+    for label, word in [("qualifier", qualifier), ("project", project)] + [("package", p) for p in packages]:
+        if not SAFE_WORD.match(word):
+            return fail("{} '{}' has characters that are not allowed".format(label, word))
+
+    # --- 2. Name and folder -------------------------------------------------
+    area = os.path.abspath(_expand(args.area))
+    lp_name = "localProducts_{}_{}_{}".format(project, version, qualifier.replace(":", "_"))
+    existing = cfg.env(args.name)
+    if existing is not None and _expand(existing.get("area", "")).rstrip("/") != area.rstrip("/"):
+        return fail("environment '{}' already exists for another area ({}).".format(args.name, existing.get("area")))
+    if existing is None:
+        problem = env_name_problem(cfg, args.name)
+        if problem:
+            return fail(problem)
+    problem = area_problem(area, lp_name)
+    if problem:
+        return fail(problem)
+    if mode == "build-only" and not os.path.isfile(os.path.join(area, lp_name, "setup")):
+        return fail("--build-only needs an existing {}/setup in {}".format(lp_name, area))
+
+    # --- 3. Build machine (first check; the script checks again) ------------
+    host_ok = on_build_host(host_patterns)
+    if mode != "no-build" and not host_ok:
+        message = build_host_refusal(host_patterns, jobs, ", or prepare the area\n"
+                                     "       here with --no-build and build it later with --build-only.")
+        if not args.dry_run:
+            return fail(message)
+        eprint("{}[dry run] the real run would stop here:{} {}".format(YELLOW, RESET, message))
+
+    # --- 4. Plan, script, container ----------------------------------------
+    build_only_cmd = "dunenv new {} {} --project {} -v {} -q {} --build-only".format(
+        args.name, area, project, version, qualifier)
+    spec = dict(name=args.name, area=area, project=project, version=version, qualifier=qualifier,
+                packages=packages, jobs=jobs, host_patterns=host_patterns, repo_url=repo_url,
+                lp_name=lp_name, mode=mode, build_only_cmd=build_only_cmd)
+
+    print("  name      : {}{}".format(args.name, "  (already registered)" if existing else ""))
+    print("  area      : {}{}".format(area, "  (empty)" if not os.listdir(area) else "  (continuing)"))
+    print("  project   : {}  ->  {}".format(project, lp_name))
+    print("  dunesw    : {} -q {}".format(version, qualifier))
+    print("  packages  : {}   (mrb g -t {})".format(", ".join(packages), version))
+    print("  build     : {}".format({"full": "mrb z, mrbsetenv, mrb i -j {}".format(jobs),
+                                     "no-build": "no (stops after mrb g)",
+                                     "build-only": "only: mrb z, mrbsetenv, mrb i -j {}".format(jobs)}[mode]))
+    print("  host      : {}  ({})".format(" / ".join(host_names()),
+                                          "build machine" if host_ok else "not a build machine"))
+
+    status = run_build_container(cfg, bash_newdev_script(cfg, spec), args.dry_run)
+    if args.dry_run:
+        return 0
+    if status != 0:
+        return fail("dunenv new stopped (exit {}). Fix the reason above, then run the same command again:\n"
+                    "       finished steps are skipped. Log: {}/dunenv_new_*.log".format(status, area), status)
+
+    # --- 5. Register --------------------------------------------------------
+    if existing is None:
+        desc = "MRB {}: {} at {} -q {}".format(project, " + ".join(packages), version, qualifier)
+        return register_env(Config(cfg.path), args.name, area, desc)
+    print("environment '{}' already registered. Later rebuilds: dunenv rebuild {}".format(args.name, args.name))
+    return 0
+
+
+# ===========================================================================
+# Block 9c - "dunenv rebuild": recompile a registered MRB area
+#   Everything is read from the registered area: its folder from [env:<name>],
+#   project / version / qualifier from its localProducts_<project>_<ver>_<qual>
+#   folder. Nothing to remember, works from any folder.
+#     dunenv rebuild NAME           incremental: mrbsetenv, make install -j N
+#                                   for edits inside existing module folders
+#                                   (.cc / .h, the module's own CMakeLists.txt,
+#                                   e.g. libraries in cet_build_plugin)
+#     dunenv rebuild NAME --clean   from scratch: mrb z, mrbsetenv, mrb i -j N
+#                                   for new folders (+ add_subdirectory in the
+#                                   parent CMakeLists.txt), new packages, or a
+#                                   confused build folder
+#   Both: build machines only (checked on the host and in the container),
+#   fresh build container, mrbslp at the end, log <area>/dunenv_rebuild_*.log.
+# ===========================================================================
+
+def cmd_rebuild(cfg, args):
+    if in_container():
+        return fail("run 'dunenv rebuild' on the host: it opens its own build container.\n"
+                    "       Already in a set-up shell on a build machine? Then: mrbsetenv; cd $MRB_BUILDDIR; make install -j20")
+    if cfg.env(args.name) is None:
+        return fail("no environment '{}'. Registered: {}  (dunenv list; register an area with dunenv add)"
+                    .format(args.name, ", ".join(cfg.env_names()) or "none"))
+    try:
+        plan = make_plan(cfg, env_name=args.name, version=args.version, qualifier=args.qualifier)
+        jobs, host_patterns = build_settings(cfg, args.jobs)
+    except PlanError as err:
+        return fail(err)
+
+    local = plan["local"]
+    mode = "rebuild-clean" if args.clean else "rebuild"
+    refusal = build_host_refusal(host_patterns, jobs, ".")
+    if refusal:
+        if not args.dry_run:
+            return fail(refusal)
+        eprint("{}[dry run] the real run would stop here:{} {}".format(YELLOW, RESET, refusal))
+
+    print("  name      : {}".format(args.name))
+    print("  area      : {}".format(plan["area"]))
+    print("  project   : {}  ->  {}".format(local["project"], os.path.basename(local["dir"])))
+    print("  dunesw    : {} -q {}".format(plan["version"], plan["qualifier"]))
+    print("  build     : {}".format("clean: mrb z, mrbsetenv, mrb i -j {}".format(jobs) if args.clean
+                                    else "incremental: mrbsetenv, make install -j {}".format(jobs)))
+    print("  host      : {}".format(" / ".join(host_names())))
+
+    spec = dict(name=args.name, area=plan["area"], project=local["project"], version=plan["version"],
+                qualifier=plan["qualifier"], packages=[], jobs=jobs, host_patterns=host_patterns,
+                repo_url="", lp_name=os.path.basename(local["dir"]), mode=mode)
+    status = run_build_container(cfg, bash_newdev_script(cfg, spec), args.dry_run)
+    if args.dry_run:
+        return 0
+    if status != 0:
+        return fail("dunenv rebuild stopped (exit {}). Log: {}/dunenv_rebuild_*.log{}".format(
+            status, plan["area"], "" if args.clean else "\n       If the build folder is confused, try: dunenv rebuild {} --clean"
+            .format(args.name)), status)
+    print("use it:  dunenv {}".format(args.name))
+    return 0
+
+
+# ===========================================================================
+# Block 10 - Interactive menu ("dunenv" with no arguments)
+# ===========================================================================
+
+def _ask(prompt, default=""):
+    try:
+        answer = input(prompt).strip()
+    except EOFError:
+        answer = ""
+    return answer or default
+
+
+def cmd_menu(cfg, args):
+    names = cfg.env_names()
+    default_env = cfg.get("defaults", "env", "none")
+    print("\n{}dunenv{} - DUNE SL7 environment   (config: {})\n".format(BOLD, RESET, cfg.path))
+    print("  {}  {:<12} {:<28} {}".format("#", "environment", "dunesw", "description"))
+    rows = [("none", "{} -q {}".format(cfg.get("defaults", "version"), cfg.get("defaults", "qualifier")),
+             "dunesw + packages only")]
+    for name in names:
+        env = cfg.env(name)
+        rows.append((name, describe_products(find_local_products(_expand(env.get("area", "")))), env.get("desc", "")))
+    for i, row in enumerate(rows):
+        print("  {}  {:<12} {:<28} {}".format(i, *row))
+
+    default_index = next((i for i, row in enumerate(rows) if row[0] == default_env), 0)
+    choice = _ask("\nEnvironment [0-{}, Enter = {}]: ".format(len(rows) - 1, rows[default_index][0]),
+                  str(default_index))
+    if choice.isdigit() and int(choice) < len(rows):
+        env_name = rows[int(choice)][0]
+    elif choice in [row[0] for row in rows]:
+        env_name = choice
+    else:
+        return fail("no such choice: " + choice)
+
+    flavor = "normal"
+    if not in_container():
+        flavor = "build" if _ask("Container: (n)ormal or (b)uild [Enter = normal]: ", "n").lower().startswith("b") else "normal"
+    grid = not _ask("Token + JUSTIN + Rucio? [Y/n]: ", "y").lower().startswith("n")
+
+    try:
+        plan = make_plan(cfg, env_name=env_name, grid=grid, flavor=flavor)
+    except PlanError as err:
+        return fail(err)
+    print("\nSame thing next time:  {}{}{}\n".format(
+        BLUE, equivalent_command(plan, default_env).replace("start", "setup" if in_container() else "start"), RESET))
+    print_plan(plan)
+    script = bash_setup_script(cfg, plan)
+    if in_container():
+        return deliver_to_shell(script, "setup " + env_name)
+    return launch_container(cfg, flavor, script)
+
+
+# ===========================================================================
+# Block 11 - Command line
+# ===========================================================================
+
+HELP = """\
+{b}dunenv{r} - start the DUNE SL7 container and set up dunesw, local MRB builds,
+UPS packages, token, JUSTIN and Rucio. Everything configurable is in dunenv.ini.
+
+{b}Everyday{r}
+  dunenv                        menu: pick environment / container / grid
+  dunenv start                  container + dunesw + packages + grid
+  dunenv start pana             ... + local protoduneana (MRB) build
+  dunenv start pana build       same, in the build container (no /pnfs bind)
+  dunenv pana build             same (a known env name or "build" implies start)
+  dunenv shell [build]          container only, no setup
+
+{b}Inside the container{r}  (the "dunenv" shell function is already loaded)
+  dunenv setup [ENV]            set up this shell
+  dunenv justin                 finish token/JUSTIN/Rucio after browser authorization
+  dunenv status [-v]            what is set up here (-v: active UPS products)
+
+{b}Options for start / setup{r}
+  -v VERSION -q QUAL            dunesw release (for no env, or to pick a local build)
+  -p "name ver -q qual"         extra UPS product for this run (repeatable)
+  --no-grid / --grid            skip / force token + JUSTIN + Rucio
+  --dev                         also run mrbsetenv (needed to compile with mrb i)
+  -n, --dry-run                 show the plan and generated script, do nothing
+
+{b}New MRB area{r}  (you create the empty folder; build only on dunebuild*)
+  dunenv new NAME DIR -v VER [-q QUAL] [--project P] [-p pkg]... [-j N]
+                                newDev + mrb g + mrb z/mrbsetenv/mrb i + register NAME
+  dunenv new ... --no-build     stop after mrb g (add your modules; works on a gpvm)
+  dunenv new ... --build-only   only build an area prepared before
+  dunenv new ... -n             show the checks and the script, run nothing
+
+{b}Rebuild a registered MRB area{r}  (from any folder; build machines only)
+  dunenv rebuild NAME           edits in existing module folders (.cc/.h, module CMakeLists):
+                                mrbsetenv + make install -j N
+  dunenv rebuild NAME --clean   new folders (+ add_subdirectory), new packages, confused build:
+                                mrb z + mrbsetenv + mrb i -j N
+  dunenv rebuild NAME -j 30     other job count (with or without --clean); -n = dry run
+
+{b}Configuration{r}
+  dunenv list [-v]              defaults, packages, environments + their builds
+  dunenv add NAME AREA [--desc] register a new MRB area (release read from localProducts_*)
+  dunenv rm NAME                forget an environment (files untouched)
+  dunenv scan [DIR]             find MRB areas under DIR (default /exp/dune/app/users/$USER)
+  dunenv set KEY VALUE [--env NAME]   e.g.  dunenv set version v10_18_00
+  dunenv pkg add|rm|list ["name ver -q qual"] [--env NAME]
+  dunenv edit                   open dunenv.ini in $EDITOR
+  dunenv script [ENV] [opts]    print the setup script  (source <(dunenv script pana))
+"""
+
+COMMANDS = ("start", "setup", "shell", "justin", "status", "list", "ls", "add", "rm",
+            "set", "pkg", "scan", "edit", "script", "menu", "help", "new", "rebuild")
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="dunenv", add_help=False)
+    sub = parser.add_subparsers(dest="cmd")
+
+    def setup_options(p):
+        p.add_argument("words", nargs="*", help="environment name and/or 'build'")
+        p.add_argument("-v", "--version", help="dunesw version")
+        p.add_argument("-q", "--qualifier", "--qual", help="dunesw qualifier, e.g. e26:prof")
+        p.add_argument("-p", "--pkg", action="append", default=[], help='extra UPS product: "name ver -q qual"')
+        p.add_argument("--grid", dest="grid", action="store_true", default=None)
+        p.add_argument("--no-grid", dest="grid", action="store_false")
+        p.add_argument("--dev", action="store_true", help="run mrbsetenv before mrbslp")
+        p.add_argument("--build", action="store_true", help="build container")
+        p.add_argument("-n", "--dry-run", action="store_true")
+
+    for name, func in (("start", cmd_start), ("setup", cmd_setup), ("script", cmd_script)):
+        p = sub.add_parser(name)
+        setup_options(p)
+        p.set_defaults(func=func)
+
+    p = sub.add_parser("shell")
+    p.add_argument("words", nargs="*")
+    p.add_argument("--build", action="store_true")
+    p.add_argument("-n", "--dry-run", action="store_true")
+    p.set_defaults(func=cmd_shell)
+
+    for name, func in (("list", cmd_list), ("ls", cmd_list), ("status", cmd_status)):
+        p = sub.add_parser(name)
+        p.add_argument("-v", "--verbose", action="store_true")
+        p.set_defaults(func=func)
+
+    sub.add_parser("justin").set_defaults(func=cmd_justin)
+    sub.add_parser("edit").set_defaults(func=cmd_edit)
+    sub.add_parser("menu").set_defaults(func=cmd_menu)
+
+    p = sub.add_parser("add")
+    p.add_argument("name")
+    p.add_argument("area")
+    p.add_argument("--desc", default="")
+    p.set_defaults(func=cmd_add)
+
+    p = sub.add_parser("rm")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_rm)
+
+    p = sub.add_parser("set")
+    p.add_argument("key")
+    p.add_argument("value")
+    p.add_argument("--env", default="")
+    p.set_defaults(func=cmd_set)
+
+    p = sub.add_parser("pkg")
+    p.add_argument("action", choices=("add", "rm", "list"), nargs="?", default="list")
+    p.add_argument("spec", nargs="*")
+    p.add_argument("--env", default="")
+    p.set_defaults(func=cmd_pkg)
+
+    p = sub.add_parser("new")
+    p.add_argument("name", help="environment name to register, e.g. pana26")
+    p.add_argument("area", help="the folder you created for the MRB area ('.' works)")
+    p.add_argument("-v", "--version", required=True, help="dunesw release, e.g. v10_26_00d05")
+    p.add_argument("-q", "--qualifier", "--qual", help="default: [defaults] qualifier")
+    p.add_argument("--project", help="MRB_PROJECT name; default: [newdev] project")
+    p.add_argument("-p", "--pkg", action="append", default=[], help="package to mrb g (repeatable; replaces the list)")
+    p.add_argument("-j", "--jobs", type=int, help="parallel build jobs; default: [newdev] jobs")
+    p.add_argument("--no-build", action="store_true", help="stop after mrb g")
+    p.add_argument("--build-only", action="store_true", help="only build an area made before")
+    p.add_argument("-n", "--dry-run", action="store_true")
+    p.set_defaults(func=cmd_new)
+
+    p = sub.add_parser("rebuild")
+    p.add_argument("name", help="registered environment, e.g. nbana")
+    p.add_argument("--clean", action="store_true", help="from scratch: mrb z, mrbsetenv, mrb i")
+    p.add_argument("-j", "--jobs", type=int, help="parallel build jobs; default: [newdev] jobs")
+    p.add_argument("-v", "--version", help="only if the area holds several builds")
+    p.add_argument("-q", "--qualifier", "--qual", help="only if the area holds several builds")
+    p.add_argument("-n", "--dry-run", action="store_true")
+    p.set_defaults(func=cmd_rebuild)
+
+    p = sub.add_parser("scan")
+    p.add_argument("dir", nargs="?", default="/exp/dune/app/users/${USER}")
+    p.add_argument("--depth", type=int, default=3)
+    p.set_defaults(func=cmd_scan)
+    return parser
+
+
+def main(argv):
+    cfg = Config(CONFIG_PATH)
+
+    if not argv:
+        return cmd_menu(cfg, None) if sys.stdin.isatty() else (print(HELP.format(b=BOLD, r=RESET)) or 0)
+    if argv[0] in ("-h", "--help", "help"):
+        print(HELP.format(b=BOLD, r=RESET))
+        return 0
+    # Shortcuts: "dunenv pana", "dunenv build", "dunenv pana build" -> start (setup inside a container).
+    if argv[0] not in COMMANDS and not argv[0].startswith("-"):
+        if argv[0] in cfg.env_names() or argv[0] in ("build", "normal") or argv[0].lower() in NO_ENV_NAMES:
+            argv = ["setup" if in_container() else "start"] + argv
+        else:
+            return fail("unknown command or environment '{}'  (dunenv help, dunenv list)".format(argv[0]))
+
+    args = build_parser().parse_args(argv)
+    if not hasattr(args, "func"):
+        print(HELP.format(b=BOLD, r=RESET))
+        return 2
+    return args.func(cfg, args) or 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
