@@ -553,16 +553,3 @@ Not sure what a command will do? Add `-n`: it prints the full script that would 
 | `dunenv` | Python program (3.6+). Reads `dunenv.ini`, builds the setup script, starts the container. Never changes your shell itself |
 | `dunenv.sh` | Bash file. It is read as the container shell's startup file: it runs the setup that `dunenv start` passed in, defines the `dunenv` command (which applies `setup`/`justin` to your current shell), and sets the `[user@host:os dir]$` prompt |
 | `dunenv.ini` | Your settings, created on the first run |
-
-### Coming from duneSL7_setup.sh
-
-| Old | New |
-|---|---|
-| `./duneSL7_setup.sh start` | `dunenv start` |
-| `./duneSL7_setup.sh start pana` | `dunenv start pana` (or `dunenv pana`) |
-| `./duneSL7_setup.sh start build pana` | `dunenv start pana build` |
-| `./duneSL7_setup.sh container [build]` | `dunenv shell [build]` |
-| `source duneSL7_setup.sh setup pana` | `dunenv setup pana` |
-| `justinsetupSL7_dune` | `dunenv justin` |
-| `DUNESW_VERSION=... ./duneSL7_setup.sh start` | `dunenv start -v ...` or `dunenv set version ...` |
-| `PROTODUNEANA_BASE=...` | `dunenv add <name> <area>` |
