@@ -340,9 +340,9 @@ With more packages:
 dunenv new nbana . --project protoduneana -v v10_26_00d05 -q e26:prof -p protoduneana -p duneprototypes
 ```
 
-#### `Which packages can go after `-p`. 
+#### Which packages can go after `-p`
 
-dunenv checks every `-p` package for the tag
+`dunenv` checks every `-p` package for the tag
 `<ver>` on `https://github.com/DUNE/<package>.git` before it creates anything
 (`[newdev] repo_url`). So `-p` works for DUNE repositories (`dune*`, `protoduneana`)
 that are tagged with the *same version as dunesw*. To list them, ask `ups depend` for
@@ -469,7 +469,7 @@ dunenv rebuild myana -p duneprototypes       # on dunebuild02
 * As with the other rebuild modes, nothing to remember: the package is checked out at
   the area's own version (`v10_26_00d05` for an area of that release).
 * Which packages are possible, and how to check their tag, is in
-  [8.1](#--project-and--p-are-not-the-same-thing): DUNE packages with the dunesw version.
+  [8.1](#which-packages-can-go-after--p): DUNE packages with the dunesw version.
 * A package already in `srcs/` is skipped (the summary lists it), so after a failure you
   fix the cause and run the **same command** again.
 * Watch for undeclared dependencies. If the new package is needed by one you already
@@ -531,6 +531,7 @@ Settable from the command line: `dunenv set KEY VALUE` for `[defaults]`, or
 | `dunenv: command not found` | The `.bash_profile` line from [install](#3-install) is missing or not loaded yet: `source ~/.bash_profile`, or call it as `~/dunenv/dunenv` |
 | `setup dunesw failed` | That version/qualifier doesn't exist. List them ([section 5](#5-choosing-a-dunesw-version)), then `dunenv setup -v ... -q ...` |
 | `JUSTIN authorization is required` | Open the printed URL, approve, then `dunenv justin` in the same shell |
+| Under `=== JUSTIN / Rucio ===`: `Cannot connect to the Rucio server`, after lines like `ConnectionError: HTTPSConnectionPool(host='dune-rucio.fnal.gov', port=443) ... /auth/x509_proxy ... SSLError ... TLSV1_ALERT_UNKNOWN_CA` | Not a dunenv problem. The JUSTIN / Rucio side rejected the credentials this time. Run the step again in the same shell: `dunenv justin`. It usually works on the next try |
 | htgettoken asks for a browser login every time | Normal after the stored token expires; log in again |
 | `This step changes the current shell, so it must be sourced` | You ran `~/dunenv/dunenv setup` directly. Use the `dunenv` command (the shell function) instead |
 | `setup runs inside the SL7 container` | You are on the gpvm itself: use `dunenv start` |
