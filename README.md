@@ -340,7 +340,7 @@ With more packages:
 dunenv new nbana . --project protoduneana -v v10_26_00d05 -q e26:prof -p protoduneana -p duneprototypes
 ```
 
-#### `**Which packages can go after `-p`.** 
+#### `Which packages can go after `-p`. 
 
 dunenv checks every `-p` package for the tag
 `<ver>` on `https://github.com/DUNE/<package>.git` before it creates anything
