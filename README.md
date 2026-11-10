@@ -209,6 +209,7 @@ dunenv NAME build               # short form: a known name or "build" implies st
 dunenv shell [build]            # container only, nothing set up
 dunenv list [-v]                # defaults, packages, your local builds
 dunenv rebuild NAME [--clean]   # recompile your local build NAME (build machines only, section 8.3)
+dunenv rebuild NAME -p PKG      # add package PKG to it, then recompile from scratch
 ```
 
 Inside the container:
@@ -275,8 +276,8 @@ never creates the folder itself.
 ssh <you>@dunebuild02.fnal.gov                       # the build runs only on a build machine
 mkdir /exp/dune/app/users/$USER/protoDUNE/dev_v10_26_00d05
 cd    /exp/dune/app/users/$USER/protoDUNE/dev_v10_26_00d05
-dunenv new pana26 . --project protoduneana -v v10_26_00d05 -q e26:prof -n   # look first
-dunenv new pana26 . --project protoduneana -v v10_26_00d05 -q e26:prof      # then run
+dunenv new pana26 . --project protoduneana -v v10_26_00d05 -q e26:prof -p protoduneana -p duneprototypes -n   # look first
+dunenv new pana26 . --project protoduneana -v v10_26_00d05 -q e26:prof -p protoduneana -p duneprototypes      # then run
 dunenv pana26                                        # use it
 ```
 
@@ -308,11 +309,57 @@ run the **same command** again. The whole output is also saved in
 | `-v VER` | release (required) |
 | `-q QUAL` | qualifier (default: `[defaults] qualifier`) |
 | `--project P` | `MRB_PROJECT` name (default: `[newdev] project`) |
-| `-p PKG` | package to check out; repeat for several. Replaces the `[newdev]` list for this run |
+| `-p PKG` | a code package to download into `srcs/` (`mrb g -t <ver> PKG`) and compile. Give one `-p` per package (`-p protoduneana -p duneprototypes`). When used, these replace the `[newdev] packages` list for this run |
 | `-j N` | build jobs (default: `[newdev] jobs`) |
 | `--no-build` | stop after `mrb g`, e.g. to copy your own modules into `srcs/` first. Allowed on a gpvm |
 | `--build-only` | only steps 1, 5, 6 (and 7) for an area prepared with `--no-build` |
 | `-n` | print the checks and the full script; run nothing |
+
+#### `--project` and `-p` are not the same thing
+
+In the examples here both say `protoduneana`, only because the area was named after the
+package it builds. They are two separate settings:
+
+* `--project` is only a **name for the whole area**. It becomes `MRB_PROJECT` and the
+  folder name `localProducts_<project>_<ver>_<qual>`. It doesn't check out or build anything.
+* `-p` names a **package**: a code repository that is checked out into `srcs/` with
+  `mrb g -t <ver> <package>` and compiled. Repeat it to check out several.
+
+So in
+
+```bash
+dunenv new nbana . --project protoduneana -v v10_26_00d05 -q e26:prof -p protoduneana
+```
+
+the first `protoduneana` names the area and the second one checks out the protoduneana code.
+This is the same as leaving `-p` out, because `protoduneana` is the default package list.
+With more packages:
+
+```bash
+# area named "protoduneana", with protoduneana + duneprototypes checked out
+dunenv new nbana . --project protoduneana -v v10_26_00d05 -q e26:prof -p protoduneana -p duneprototypes
+```
+
+**Which packages can go after `-p`.** dunenv checks every `-p` package for the tag
+`<ver>` on `https://github.com/DUNE/<package>.git` before it creates anything
+(`[newdev] repo_url`). So `-p` works for DUNE repositories (`dune*`, `protoduneana`)
+that are tagged with the *same version as dunesw*. To list them, ask `ups depend` for
+the packages whose version is exactly that release:
+
+```bash
+# packages of this release with version v10_26_00d05 = candidates for -p
+ups depend dunesw v10_26_00d05 -q e26:prof | grep -oE "__[a-z_0-9]+ v10_26_00d05" | sed 's/^__//' | sort -u
+
+# confirm one candidate has the tag on GitHub (prints a line if it does)
+git ls-remote --tags https://github.com/DUNE/dunereco.git refs/tags/v10_26_00d05
+```
+
+LArSoft packages (`larreco`, `larsim`, ...) have their own versions (e.g. `v10_17_01`)
+and live under `github.com/LArSoft`, so they fail this check. Check those out by hand
+with `mrb g -t <their version> <package>` in `srcs/`, after `--no-build`.
+
+Check out only the packages you'll edit. A package that another checked-out package
+needs but doesn't declare can break the build (see *Check out only what you change* below).
 
 Two-step version, to add your own modules before compiling:
 
@@ -380,16 +427,18 @@ ssh <you>@dunebuild02.fnal.gov    # rebuilds run only on build machines
 dunenv rebuild myana              # incremental
 dunenv rebuild myana --clean      # from scratch
 dunenv rebuild myana -j 30        # other job count; works with --clean too
+dunenv rebuild myana -p duneprototypes   # add a package to srcs/, then build from scratch
 dunenv rebuild myana -n           # show what would run; run nothing
 ```
 
 | Command | Runs | Use it when |
 |---|---|---|
 | `dunenv rebuild myana` | `mrbsetenv`, `make install -j 20`, `mrbslp` | **Edits inside existing module folders.** You changed `.cc` / `.h` files, or the module folder's own `CMakeLists.txt`, e.g. adding a missing library to `cet_build_plugin(XXXXX::Module ...)`. Only what changed recompiles. This is the everyday case |
-| `dunenv rebuild myana --clean` | `mrb z`, `mrbsetenv`, `mrb i -j 20`, `mrbslp` | **New folders.** You added a new folder with new code, plus its `add_subdirectory(...)` line in the `CMakeLists.txt` one level up (the file that lists the subfolders). Also use it when the build folder is confused (odd CMake cache errors, stale libraries), when the incremental build stops with "no Makefile", or after adding a new package to `srcs/` (run `mrb uc` first). Everything recompiles, so it takes much longer |
+| `dunenv rebuild myana --clean` | `mrb z`, `mrbsetenv`, `mrb i -j 20`, `mrbslp` | **New folders.** You added a new folder with new code, plus its `add_subdirectory(...)` line in the `CMakeLists.txt` one level up (the file that lists the subfolders). Also use it when the build folder is confused (odd CMake cache errors, stale libraries), when the incremental build stops with "no Makefile", or after adding a new package to `srcs/` by hand (run `mrb uc` first). Everything recompiles, so it takes much longer |
+| `dunenv rebuild myana -p PKG` | tag check, `mrb g -t <version> PKG`, `mrb uc`, then the same as `--clean` | **New packages.** You want to edit a package you didn't check out when the area was made. One `-p` per package (`-p duneprototypes -p dunereco`). See below |
 | `-j N` | the same, with N parallel jobs | Not a mode, just the job count. Default: `jobs` in `[newdev]` (20) |
 
-Both modes:
+All modes:
 * open a fresh build container, set up the area's dunesw, and end with `mrbslp`, so the
   next `dunenv myana` uses the new build;
 * refuse to run off a build machine (`build_hosts` in `[newdev]`). This is checked on the
@@ -406,6 +455,26 @@ dunenv rebuild myana --clean      # on dunebuild02
 
 Later edits to that module's `.cc` / `.h` files or to its own `CMakeLists.txt`:
 `dunenv rebuild myana`.
+
+Adding a package to an area you already built (e.g. it has only protoduneana and you now
+also need to change duneprototypes):
+
+```bash
+dunenv rebuild myana -p duneprototypes -n    # look first
+dunenv rebuild myana -p duneprototypes       # on dunebuild02
+```
+
+* As with the other rebuild modes, nothing to remember: the package is checked out at
+  the area's own version (`v10_26_00d05` for an area of that release).
+* Which packages are possible, and how to check their tag, is in
+  [8.1](#--project-and--p-are-not-the-same-thing): DUNE packages with the dunesw version.
+* A package already in `srcs/` is skipped (the summary lists it), so after a failure you
+  fix the cause and run the **same command** again.
+* Watch for undeclared dependencies. If the new package is needed by one you already
+  have, but not listed in its `ups/product_deps`, the build fails (the dunereco case in
+  8.1, *Check out only what you change*).
+* The description shown by `dunenv list` stays as it was. Change it with
+  `dunenv set desc "..." --env myana`.
 
 `dunenv rebuild` must be started from the gpvm or build-machine shell, not from inside a
 container. If you're already in a set-up container on a build machine (e.g. after
@@ -435,7 +504,7 @@ lines. Indented lines continue the value above them (that's how the package list
 | `[exports]` | variables exported before UPS starts (`UPS_OVERRIDE`, MetaCat URLs, certificates) |
 | `[grid]` | `token_cmd` (the htgettoken command), `rucio_account` |
 | `[container]` | apptainer path, image, mounted folders for the normal (`binds`) and build (`build_binds`) containers |
-| `[newdev]` | defaults for `dunenv new`: `project`, `packages`, `jobs`, `build_hosts`, `repo_url`. `dunenv rebuild` uses `jobs` and `build_hosts` too |
+| `[newdev]` | defaults for `dunenv new`: `project`, `packages`, `jobs`, `build_hosts`, `repo_url`. `dunenv rebuild` uses `jobs` and `build_hosts` too, and `repo_url` with `-p` |
 | `[env:<name>]` | one per local build (section 8) |
 
 Settable from the command line: `dunenv set KEY VALUE` for `[defaults]`, or

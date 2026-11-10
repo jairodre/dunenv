@@ -12,7 +12,7 @@ One command for the whole workflow that duneSL7_setup.sh does:
     dunenv list                        dunenv justin
     dunenv add NAME AREA               dunenv status
     dunenv new NAME DIR -v VER  (create + build an MRB area, dunebuild* only)
-    dunenv rebuild NAME [--clean]  (recompile a registered area, dunebuild* only)
+    dunenv rebuild NAME [--clean] [-p PKG]  (recompile a registered area / add a package, dunebuild* only)
 
 Everything that can change lives in dunenv.ini (next to this file):
 dunesw version/qualifier, extra UPS packages, exported variables, container
@@ -929,7 +929,7 @@ NEWDEV_UPS = r"""
 """
 
 NEWDEV_TAGS = r"""
-    _step 2 "Tags $VERSION on GitHub"
+    _step @STEP_TAGS@ "Tags $VERSION on GitHub"
 @TAG_LINES@
 """
 
@@ -961,9 +961,14 @@ NEWDEV_SOURCE = r"""
 """
 
 NEWDEV_CHECKOUT = r"""
-    _step 4 "Check out packages at $VERSION"
+    _step @STEP_CHECKOUT@ "Check out packages at $VERSION"
     cd "$MRB_SOURCE" || _stop "MRB_SOURCE is not set"
 @CHECKOUT_LINES@
+"""
+
+# dunenv rebuild -p: after adding packages to srcs/, refresh srcs/CMakeLists.txt
+REBUILD_UPDATE_CMAKE = r"""
+    mrb uc || _stop "mrb uc failed"
 """
 
 NEWDEV_HOST_CHECK = r"""
@@ -1010,16 +1015,22 @@ exit "${PIPESTATUS[0]}"
 def bash_newdev_script(cfg, spec):
     """Assemble the bash run inside the build container for 'dunenv new' / 'dunenv rebuild'.
 
-    spec["mode"]:  full | no-build | build-only      (dunenv new)
-                   rebuild | rebuild-clean           (dunenv rebuild)
+    spec["mode"]:  full | no-build | build-only          (dunenv new)
+                   rebuild | rebuild-clean | rebuild-add (dunenv rebuild, rebuild --clean, rebuild -p)
     """
-    rebuild = spec["mode"].startswith("rebuild")
-    step_host, step_build = ("2", "3") if rebuild else ("5", "6")
+    mode = spec["mode"]
+    rebuild = mode.startswith("rebuild")
+    # step numbers shown in the log:   tags, checkout, host check, build
+    steps = {"rebuild": ("-", "-", "2", "3"),
+             "rebuild-clean": ("-", "-", "2", "3"),
+             "rebuild-add": ("2", "3", "4", "5")}.get(mode, ("2", "4", "5", "6"))
     tokens = {
         "@COMMAND@": "dunenv rebuild" if rebuild else "dunenv new",
         "@LOG_PREFIX@": "dunenv_rebuild" if rebuild else "dunenv_new",
-        "@STEP_HOST@": step_host,
-        "@STEP_BUILD@": step_build,
+        "@STEP_TAGS@": steps[0],
+        "@STEP_CHECKOUT@": steps[1],
+        "@STEP_HOST@": steps[2],
+        "@STEP_BUILD@": steps[3],
         "@NAME@": spec["name"],
         "@AREA@": spec["area"],
         "@AREA_Q@": _q(spec["area"]),
@@ -1039,13 +1050,16 @@ def bash_newdev_script(cfg, spec):
     }
 
     chunks = [NEWDEV_HEAD, "\n".join(bash_export_lines(cfg)) + "\n", NEWDEV_UPS]
-    if spec["mode"] == "rebuild":
+    if mode == "rebuild":
         chunks += [NEWDEV_SOURCE, REBUILD_INCREMENTAL]
-    elif spec["mode"] in ("build-only", "rebuild-clean"):
+    elif mode in ("build-only", "rebuild-clean"):
         chunks += [NEWDEV_SOURCE, NEWDEV_BUILD]
+    elif mode == "rebuild-add":
+        # existing area: no mrb newDev; add the packages, then always a clean build
+        chunks += [NEWDEV_TAGS, NEWDEV_SOURCE, NEWDEV_CHECKOUT, REBUILD_UPDATE_CMAKE, NEWDEV_BUILD]
     else:
         chunks += [NEWDEV_TAGS, NEWDEV_CREATE, NEWDEV_SOURCE, NEWDEV_CHECKOUT]
-        chunks.append(NEWDEV_NO_BUILD_END if spec["mode"] == "no-build" else NEWDEV_BUILD)
+        chunks.append(NEWDEV_NO_BUILD_END if mode == "no-build" else NEWDEV_BUILD)
     chunks.append(NEWDEV_TAIL)
 
     script = "".join(chunks)
@@ -1188,7 +1202,12 @@ def cmd_new(cfg, args):
 #                                   for new folders (+ add_subdirectory in the
 #                                   parent CMakeLists.txt), new packages, or a
 #                                   confused build folder
-#   Both: build machines only (checked on the host and in the container),
+#     dunenv rebuild NAME -p PKG    add package PKG (repeatable) to srcs/:
+#                                   tag check, mrb g -t <area version> PKG,
+#                                   mrb uc, then the clean build (always).
+#                                   Packages already in srcs/ are skipped, so
+#                                   the same command can simply be run again.
+#   All: build machines only (checked on the host and in the container),
 #   fresh build container, mrbslp at the end, log <area>/dunenv_rebuild_*.log.
 # ===========================================================================
 
@@ -1206,7 +1225,15 @@ def cmd_rebuild(cfg, args):
         return fail(err)
 
     local = plan["local"]
-    mode = "rebuild-clean" if args.clean else "rebuild"
+    for pkg in args.pkg:
+        if not SAFE_WORD.match(pkg):
+            return fail("package '{}' has characters that are not allowed".format(pkg))
+    # -p: add packages; a new package always needs the clean build
+    mode = "rebuild-add" if args.pkg else "rebuild-clean" if args.clean else "rebuild"
+    clean = mode != "rebuild"
+    repo_url = cfg.get("newdev", "repo_url", "https://github.com/DUNE/{package}.git")
+    srcs = os.path.join(plan["area"], "srcs")
+    present = [p for p in args.pkg if os.path.isdir(os.path.join(srcs, p))]
     refusal = build_host_refusal(host_patterns, jobs, ".")
     if refusal:
         if not args.dry_run:
@@ -1217,20 +1244,30 @@ def cmd_rebuild(cfg, args):
     print("  area      : {}".format(plan["area"]))
     print("  project   : {}  ->  {}".format(local["project"], os.path.basename(local["dir"])))
     print("  dunesw    : {} -q {}".format(plan["version"], plan["qualifier"]))
-    print("  build     : {}".format("clean: mrb z, mrbsetenv, mrb i -j {}".format(jobs) if args.clean
+    if args.pkg:
+        print("  add       : {}   (mrb g -t {}){}".format(
+            ", ".join(args.pkg), plan["version"],
+            "   already in srcs/, skipped: " + ", ".join(present) if present else ""))
+    print("  build     : {}".format("clean: mrb z, mrbsetenv, mrb i -j {}".format(jobs) if clean
                                     else "incremental: mrbsetenv, make install -j {}".format(jobs)))
     print("  host      : {}".format(" / ".join(host_names())))
 
     spec = dict(name=args.name, area=plan["area"], project=local["project"], version=plan["version"],
-                qualifier=plan["qualifier"], packages=[], jobs=jobs, host_patterns=host_patterns,
-                repo_url="", lp_name=os.path.basename(local["dir"]), mode=mode)
+                qualifier=plan["qualifier"], packages=args.pkg, jobs=jobs, host_patterns=host_patterns,
+                repo_url=repo_url, lp_name=os.path.basename(local["dir"]), mode=mode)
     status = run_build_container(cfg, bash_newdev_script(cfg, spec), args.dry_run)
     if args.dry_run:
         return 0
     if status != 0:
+        hint = ("\n       Fix the reason above and run the same command again: packages already"
+                " checked out are skipped." if args.pkg else
+                "" if clean else
+                "\n       If the build folder is confused, try: dunenv rebuild {} --clean".format(args.name))
         return fail("dunenv rebuild stopped (exit {}). Log: {}/dunenv_rebuild_*.log{}".format(
-            status, plan["area"], "" if args.clean else "\n       If the build folder is confused, try: dunenv rebuild {} --clean"
-            .format(args.name)), status)
+            status, plan["area"], hint), status)
+    if args.pkg:
+        print("description shown by 'dunenv list' (change it if you like):\n"
+              "  dunenv set desc \"...\" --env {}".format(args.name))
     print("use it:  dunenv {}".format(args.name))
     return 0
 
@@ -1328,6 +1365,8 @@ UPS packages, token, JUSTIN and Rucio. Everything configurable is in dunenv.ini.
                                 mrbsetenv + make install -j N
   dunenv rebuild NAME --clean   new folders (+ add_subdirectory), new packages, confused build:
                                 mrb z + mrbsetenv + mrb i -j N
+  dunenv rebuild NAME -p PKG    add package PKG to srcs/ (repeatable), at the area's version:
+                                tag check + mrb g -t + mrb uc + the --clean build
   dunenv rebuild NAME -j 30     other job count (with or without --clean); -n = dry run
 
 {b}Configuration{r}
@@ -1418,6 +1457,8 @@ def build_parser():
     p = sub.add_parser("rebuild")
     p.add_argument("name", help="registered environment, e.g. nbana")
     p.add_argument("--clean", action="store_true", help="from scratch: mrb z, mrbsetenv, mrb i")
+    p.add_argument("-p", "--pkg", action="append", default=[],
+                   help="package to add to srcs/ (mrb g -t <area version>; repeatable; implies --clean)")
     p.add_argument("-j", "--jobs", type=int, help="parallel build jobs; default: [newdev] jobs")
     p.add_argument("-v", "--version", help="only if the area holds several builds")
     p.add_argument("-q", "--qualifier", "--qual", help="only if the area holds several builds")
